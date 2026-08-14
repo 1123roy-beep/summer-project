@@ -4,9 +4,6 @@ import urllib.request
 import pandas as pd
 import time
 
-# ==========================================
-# 1. 參數與路徑設定
-# ==========================================
 DATE_STR = "2023_01_01"
 PROCESSED_DIR = "data/processed"
 REPORTS_DIR = "reports"
@@ -14,37 +11,24 @@ ANOMALY_CSV = os.path.join(PROCESSED_DIR, f"sf_bay_anomalies_{DATE_STR}.csv")
 OUTPUT_REPORT = os.path.join(REPORTS_DIR, "agent_analysis_summary.md")
 
 OLLAMA_API_URL = "http://localhost:11434/api/generate"
-MODEL_NAME = "qwen2.5:3b"
-TOP_N = 3  # 預設自動分析異常排名前 3 名的船舶
+MODEL_NAME = "llama3.1:8b"
+TOP_N = 3
 
 os.makedirs(REPORTS_DIR, exist_ok=True)
-
-# ==========================================
-# 2. 讀取數據與計算母體基準 (Population Baseline)
-# ==========================================
-print(f"[*] 讀取異常結果表: {ANOMALY_CSV}")
 df = pd.read_csv(ANOMALY_CSV)
 
-# 計算全體船舶的統計平均值作為對照基準
-baseline = {
-    'mean_sog_avg': df['mean_sog'].mean(),
-    'cog_std_avg': df['cog_std'].mean(),
-    'stop_ratio_avg': df['stop_ratio'].mean(),
-    'dist_avg': df['total_dist_nmi'].mean()
-}
+# 計算母體基準
+avg_sog = df['mean_sog'].mean()
+avg_cog_std = df['cog_std'].mean()
+avg_stop = df['stop_ratio'].mean()
+avg_dist = df['total_dist_nmi'].mean()
 
-# ==========================================
-# 3. 呼叫本地 Ollama 生成專業分析
-# ==========================================
 def query_ollama(prompt):
-    """透過 HTTP REST API 呼叫本地運行的 Ollama 模型"""
     payload = {
         "model": MODEL_NAME,
         "prompt": prompt,
         "stream": False,
-        "options": {
-            "temperature": 0.2  # 低溫保持分析客觀與邏輯嚴謹
-        }
+        "options": {"temperature": 0.1}
     }
     req = urllib.request.Request(
         OLLAMA_API_URL,
@@ -53,45 +37,68 @@ def query_ollama(prompt):
     )
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode('utf-8'))
-            return data.get('response', '')
+            return json.loads(resp.read().decode('utf-8')).get('response', '')
     except Exception as e:
-        return f"連線 Ollama 失敗: {e}。請確認終端機是否可執行 ollama。"
+        return f"連線失敗: {e}"
 
-# ==========================================
-# 4. 逐船生成結構化研究報告
-# ==========================================
-print(f"[*] 啟動 AI Agent 分析 Top {TOP_N} 異常船舶...")
-start_time = time.time()
+# ============================================================
+# Python 工具層：預先計算客觀海事物理事實 (Deterministic Facts)
+# ============================================================
+def generate_vessel_facts(row):
+    facts = []
+    # 速度對比
+    sog_ratio = row['mean_sog'] / (avg_sog + 1e-5)
+    if sog_ratio >= 3.0:
+        facts.append(f"- 【航速特徵】：平均 SOG ({row['mean_sog']} 節) 高達全體平均 ({avg_sog:.1f} 節) 的 {sog_ratio:.1f} 倍，屬於持續高航速運作。")
+    elif row['mean_sog'] < 1.0:
+        facts.append(f"- 【航速特徵】：平均 SOG ({row['mean_sog']} 節) 低於 1 節，長時間處於極低速或靜止狀態。")
+    else:
+        facts.append(f"- 【航速特徵】：平均 SOG ({row['mean_sog']} 節) 接近常規巡航速度。")
+
+    # 航向變異分析
+    if row['cog_std'] >= 140:
+        facts.append(f"- 【轉向行為】：航向標準差高達 {row['cog_std']}° (全體平均僅 {avg_cog_std:.1f}°)，呈現近乎 180° 對蹠反向折返特性。")
+    elif row['cog_std'] >= 70:
+        facts.append(f"- 【轉向行為】：航向標準差為 {row['cog_std']}°，轉向頻繁，非直線航道保持。")
+    else:
+        facts.append(f"- 【轉向行為】：航向標準差 {row['cog_std']}°，航線筆直穩定。")
+
+    # 停滯時間
+    if row['stop_ratio'] >= 0.6:
+        facts.append(f"- 【作業節奏】：有 {int(row['stop_ratio']*100)}% 時間停滯或慢速，顯示具間歇性起停或靠泊作業。")
+    elif row['stop_ratio'] <= 0.2:
+        facts.append(f"- 【作業節奏】：停滯時間僅 {int(row['stop_ratio']*100)}%，全程幾乎無間斷航行。")
+
+    # 總航程
+    dist_ratio = row['total_dist_nmi'] / (avg_dist + 1e-5)
+    facts.append(f"- 【累積活動量】：總航程 {row['total_dist_nmi']} 海浬 (全體平均 {avg_dist:.1f} 海浬，為平均的 {dist_ratio:.1f} 倍)。")
+    return "\n".join(facts)
+
+print(f"[*] 啟動 Tool-Augmented AI Agent 分析 Top {TOP_N} 船舶...")
 report_lines = [
-    "# AIS 船舶異常航行型態分析報告 (AI Agent 生成)",
-    f"- **分析日期**: {DATE_STR}",
-    f"- **分析模型**: {MODEL_NAME}",
-    f"- **全體平均基準**: 平均航速 {baseline['mean_sog_avg']:.1f} kts | 平均航向變異 {baseline['cog_std_avg']:.1f}° | 平均停滯率 {baseline['stop_ratio_avg']:.2f} | 平均航程 {baseline['dist_avg']:.1f} nmi\n",
+    "# AIS 船舶異常航行型態分析報告 (精確修正版)",
+    f"- **全體平均基準**: 平均航速 {avg_sog:.1f} kts | 航向變異 {avg_cog_std:.1f}° | 停滯率 {avg_stop:.2f} | 航程 {avg_dist:.1f} nmi\n",
     "---"
 ]
 
-top_vessels = df.head(TOP_N)
-
-for _, row in top_vessels.iterrows():
+for _, row in df.head(TOP_N).iterrows():
     mmsi = int(row['MMSI'])
     rank = int(row['anomaly_rank'])
     score = row['anomaly_score']
     
+    verified_facts = generate_vessel_facts(row)
+    
     prompt = f"""
-你是一名資深海事交通與 AIS 軌跡分析專家。請根據以下單一船舶的航行特徵與全體平均基準，提供 3~4 點簡要、客觀且具專業海事物理意義的航行型態解釋。
+你是一名海事交通與 AIS 軌跡分析專家。請嚴格根據以下由 Python 系統預先驗證的事實數據，為該船舶產出一份精確、專業、無數值矛盾的航行型態診斷。
 
-【船舶航行數據】
+【系統驗證數據與事實】
 - MMSI: {mmsi} (異常排名: Rank {rank}, 異常分數: {score:.3f})
-- 平均速度 (Mean SOG): {row['mean_sog']:.2f} 節 (全體平均: {baseline['mean_sog_avg']:.2f} 節)
-- 航向標準差 (COG Std): {row['cog_std']:.2f}° (全體平均: {baseline['cog_std_avg']:.2f}°)
-- 停滯/慢速比例 (Stop Ratio): {row['stop_ratio']:.2f} (全體平均: {baseline['stop_ratio_avg']:.2f})
-- 累積總航程 (Total Distance): {row['total_dist_nmi']:.2f} 海浬 (全體平均: {baseline['dist_avg']:.2f} 海浬)
+{verified_facts}
 
-【分析要求】
-1. 指出該船哪項特徵最顯著偏離常態。
-2. 根據運動學特徵推測其可能的海事作業型態（例如：固定航線渡輪折返、引水船待命接駁、拖船輔助作業、港內慢速盤旋、或錨泊漂移等）。
-3. 保持客觀學術語氣，說明這屬於特定作業型態之「特殊航行模式 (Anomalous Pattern)」，非直接宣稱違法或危險。
+【撰寫指引】
+1. 請以 3 個簡短重點歸納其運動學特徵。
+2. 根據事實（如高航速+180度折返、或長航程+高停滯），推測其具體海事作業型態（如雙向穿梭渡輪、引水接駁、拖船維護）。
+3. 嚴格遵守上述已驗證的數值事實，切勿自行扭曲高低關係。
 4. 請以繁體中文回答。
 """
     print(f"[*] 正在分析 Rank {rank} (MMSI: {mmsi})...")
@@ -99,8 +106,10 @@ for _, row in top_vessels.iterrows():
     
     section = f"""
 ## Rank {rank} | MMSI: {mmsi} (異常分數: {score:.3f})
-- **主要特徵**: 平均 SOG `{row['mean_sog']} kts` | 航向變異 `{row['cog_std']}°` | 停滯率 `{row['stop_ratio']}` | 總航程 `{row['total_dist_nmi']} nmi`
-- **專家代理分析**:
+**客觀物理事實**:
+{verified_facts}
+
+**專家代理判讀**:
 {analysis_text.strip()}
 
 ---"""
@@ -109,11 +118,7 @@ for _, row in top_vessels.iterrows():
     print(analysis_text.strip())
     print("-" * 50)
 
-# ==========================================
-# 5. 儲存分析結果為 Markdown
-# ==========================================
 with open(OUTPUT_REPORT, 'w', encoding='utf-8') as f:
     f.write("\n".join(report_lines))
 
-print(f"\n[+] AI Agent 分析完成！耗時: {time.time() - start_time:.2f} 秒")
-print(f"[+] 完整分析報告已儲存至: {OUTPUT_REPORT}") 
+print(f"\n[+] 精確版報告已更新至: {OUTPUT_REPORT}")

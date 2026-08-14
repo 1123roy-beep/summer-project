@@ -3,7 +3,7 @@ import urllib.request
 import zipfile
 import duckdb
 import time
-
+#%%
 # ==========================================
 # 1. 參數設定
 # ==========================================
@@ -22,7 +22,7 @@ LON_MIN, LON_MAX = -122.65, -122.05
 
 os.makedirs(RAW_DIR, exist_ok=True)
 os.makedirs(PROCESSED_DIR, exist_ok=True)
-
+#%%
 # ==========================================
 # 2. 下載 (若本機已存在 ZIP 則自動跳過)
 # ==========================================
@@ -99,3 +99,4 @@ print(f"檔案大小: {file_size_mb:.2f} MB")
 print(f"灣區軌跡點數: {total_records:,} 筆")
 print(f"灣區船舶總數: {unique_vessels:,} 艘 (Unique MMSI)")
 print("=" * 45)
+# %%
